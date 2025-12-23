@@ -1,0 +1,11 @@
+# Python junk
+__pycache__/
+*.pyc
+
+# Exports / generated output
+*.csv
+*.xlsx
+
+# OS / editor
+.DS_Store
+.vscode/
