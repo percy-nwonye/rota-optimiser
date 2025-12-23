@@ -1,0 +1,48 @@
+date,shift_id,shift_name,role,staff_id,staff_name,contract_type
+2025-01-06,long,Long Day,HCA,s1,Amaka,permanent
+2025-01-06,long,Long Day,HCA,s2,James,permanent
+2025-01-06,long,Long Day,HCA,s3,Fatima,permanent
+2025-01-06,long,Long Day,Senior,s7,Ife,permanent
+2025-01-06,night,Night,HCA,s4,Daniel,permanent
+2025-01-06,night,Night,HCA,s6,Uche,bank
+2025-01-06,night,Night,Senior,s8,Tunde,permanent
+2025-01-07,long,Long Day,HCA,s1,Amaka,permanent
+2025-01-07,long,Long Day,HCA,s2,James,permanent
+2025-01-07,long,Long Day,HCA,s5,Grace,bank
+2025-01-07,long,Long Day,Senior,s9,Helen,bank
+2025-01-07,night,Night,HCA,s4,Daniel,permanent
+2025-01-07,night,Night,HCA,s6,Uche,bank
+2025-01-07,night,Night,Senior,s7,Ife,permanent
+2025-01-08,long,Long Day,HCA,s1,Amaka,permanent
+2025-01-08,long,Long Day,HCA,s3,Fatima,permanent
+2025-01-08,long,Long Day,HCA,s5,Grace,bank
+2025-01-08,long,Long Day,Senior,s10,Zara,bank
+2025-01-08,night,Night,HCA,s2,James,permanent
+2025-01-08,night,Night,Senior,s9,Helen,bank
+2025-01-09,long,Long Day,HCA,s2,James,permanent
+2025-01-09,long,Long Day,HCA,s3,Fatima,permanent
+2025-01-09,long,Long Day,HCA,s5,Grace,bank
+2025-01-09,long,Long Day,Senior,s10,Zara,bank
+2025-01-09,night,Night,HCA,s1,Amaka,permanent
+2025-01-09,night,Night,HCA,s4,Daniel,permanent
+2025-01-09,night,Night,Senior,s8,Tunde,permanent
+2025-01-10,long,Long Day,HCA,s1,Amaka,permanent
+2025-01-10,long,Long Day,HCA,s3,Fatima,permanent
+2025-01-10,long,Long Day,HCA,s6,Uche,bank
+2025-01-10,long,Long Day,Senior,s10,Zara,bank
+2025-01-10,night,Night,HCA,s2,James,permanent
+2025-01-10,night,Night,HCA,s4,Daniel,permanent
+2025-01-10,night,Night,Senior,s7,Ife,permanent
+2025-01-11,long,Long Day,HCA,s1,Amaka,permanent
+2025-01-11,long,Long Day,HCA,s5,Grace,bank
+2025-01-11,long,Long Day,HCA,s6,Uche,bank
+2025-01-11,long,Long Day,Senior,s9,Helen,bank
+2025-01-11,night,Night,HCA,s2,James,permanent
+2025-01-11,night,Night,Senior,s8,Tunde,permanent
+2025-01-12,long,Long Day,HCA,s3,Fatima,permanent
+2025-01-12,long,Long Day,HCA,s5,Grace,bank
+2025-01-12,long,Long Day,HCA,s6,Uche,bank
+2025-01-12,long,Long Day,Senior,s10,Zara,bank
+2025-01-12,night,Night,HCA,s1,Amaka,permanent
+2025-01-12,night,Night,HCA,s4,Daniel,permanent
+2025-01-12,night,Night,Senior,s9,Helen,bank

@@ -1,0 +1,25 @@
+{
+  "constraints": {
+    "one_shift_per_day": true,
+    "max_consecutive_nights": 2,
+    "max_consecutive_long_days": 3
+  },
+  "overrides": {
+    "allow_overrides": true,
+    "interactive_overrides": true,
+    "warnings_enabled": true
+  },
+  "scoring_weights": {
+    "hours": 1.0,
+    "nights": 15.0,
+    "weekends": 10.0
+  },
+  "exports": {
+    "export_folder": ".",
+    "export_csv": true,
+    "export_excel": true
+  },
+  "cover_suggestions": {
+    "top_n": 3
+  }
+}
