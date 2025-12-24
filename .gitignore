@@ -1,11 +1,38 @@
-# Python junk
+# =========================
+# Operating system files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Editor / IDE files
+# =========================
+.vscode/
+.idea/
+
+# =========================
+# Python cache / runtime
+# =========================
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
-# Exports / generated output
+# =========================
+# Virtual environments
+# =========================
+.venv/
+venv/
+env/
+
+# =========================
+# Generated rota outputs
+# (DO NOT COMMIT RESULTS)
+# =========================
 *.csv
 *.xlsx
 
-# OS / editor
-.DS_Store
-.vscode/
+# =========================
+# Logs / temp
+# =========================
+*.log
