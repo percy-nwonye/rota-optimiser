@@ -1,7 +1,7 @@
 # rota_mvp.py
 # FULL REPLACEMENT FILE (Option B: config file driven)
 # - Uses config.json (no code edits needed for rule changes)
-# - Keeps CLI overrides (y/n) for now (UI later)
+# - CLI overrides (y/n) for now (UI later)
 # - Exports CSV + Excel (Excel auto-skips if openpyxl missing)
 
 from __future__ import annotations
@@ -86,7 +86,9 @@ def load_config(path: str = "config.json") -> Dict:
         "overrides": {
             "allow_overrides": True,
             "interactive_overrides": True,
-            "warnings_enabled": True
+            "warnings_enabled": True,
+            "require_warning_ack": False,
+            "warning_ack_phrase": "I UNDERSTAND"
         },
         "scoring_weights": {
             "hours": 1.0,
@@ -258,7 +260,7 @@ class RotaGenerator:
         reasons: List[str] = []
         s = self.staff[sid]
 
-        # hard: role mismatch (not useful to override)
+        # hard: role mismatch
         if s.role != role:
             reasons.append("Role mismatch")
 
@@ -404,9 +406,9 @@ class RotaGenerator:
                         reason="Candidate blocked (unexpected) under constraints"
                     ))
 
-        # interactive overrides (for unfilled slots)
-        ov = self.cfg["overrides"]
-        if ov["allow_overrides"] and ov["interactive_overrides"] and self.unfilled:
+        # interactive overrides (for unfilled slots) - uses the older override flow
+        ov = self.cfg.get("overrides", {})
+        if ov.get("allow_overrides", True) and ov.get("interactive_overrides", True) and self.unfilled:
             self._interactive_override_unfilled()
 
     # ---------- cover suggestions ----------
@@ -418,47 +420,230 @@ class RotaGenerator:
             if s.role != slot.role:
                 continue
             blocked = self._blocked_reasons(sid, slot.role, shift, slot.date)
+
             # exclude NON-OVERRIDABLE completely
             if any("NON-OVERRIDABLE" in r for r in blocked):
                 continue
+
             candidates.append(CoverCandidate(staff_id=sid, score=self._score(sid), blocked_by=blocked))
 
         candidates.sort(key=lambda c: c.score)
         return candidates[:top_n]
 
-    def suggest_cover(self) -> None:
-        top_n = int(self.cfg["cover_suggestions"]["top_n"])
-        if not self.unfilled:
-            print("\n================ COVER SUGGESTIONS ================")
-            print("No unfilled slots. ✅")
-            return
+    # ---------- interactive helpers (inside class) ----------
+    @staticmethod
+    def _prompt_choice(prompt: str, valid: Set[str]) -> str:
+        while True:
+            ans = input(prompt).strip().lower()
+            if ans in valid:
+                return ans
+            print(f"Please type one of: {', '.join(sorted(valid))}")
 
-        print("\n================ COVER SUGGESTIONS ================")
-        print("Best candidates for UNFILLED slots + what blocks them.")
-        print("Note: Cannot do nights is NON-OVERRIDABLE.\n")
+    @staticmethod
+    def _prompt_ack(phrase: str) -> bool:
+        ans = input(f"Type '{phrase}' to confirm: ").strip()
+        return ans == phrase
+
+    def suggest_cover(self, return_data: bool = False):
+        """
+        Print cover suggestions for unfilled slots.
+        If return_data=True, returns structured data for UI later.
+        """
+        top_n = int(self.cfg["cover_suggestions"]["top_n"])
+
+        if not self.unfilled:
+            if not return_data:
+                print("\n================ COVER SUGGESTIONS ================")
+                print("No unfilled slots. ✅")
+            return [] if return_data else None
+
+        results = []
+        if not return_data:
+            print("\n================ COVER SUGGESTIONS ================")
+            print("Best candidates for UNFILLED slots + what blocks them.")
+            print("Note: Cannot do nights is NON-OVERRIDABLE.\n")
 
         for slot in self.unfilled:
             shift = self.shift_templates[slot.shift_id]
-            print(f"UNFILLED -> Date: {slot.date} | Shift: {shift.name} | Role: {slot.role}")
             suggestions = self._suggest_for_slot(slot, top_n=top_n)
-            if not suggestions:
-                print("  No candidates available.")
+
+            options = []
+            for c in suggestions or []:
+                s = self.staff[c.staff_id]
+                options.append(
+                    {
+                        "staff_id": c.staff_id,
+                        "staff_name": s.name,
+                        "contract_type": s.contract_type,
+                        "score": float(c.score),
+                        "blocked_by": list(c.blocked_by) if c.blocked_by else [],
+                    }
+                )
+
+            results.append(
+                {
+                    "slot": slot,
+                    "shift_name": shift.name,
+                    "role": slot.role,
+                    "date": slot.date,
+                    "options": options,
+                }
+            )
+
+            if not return_data:
+                print(f"UNFILLED -> Date: {slot.date} | Shift: {shift.name} | Role: {slot.role}")
+                if not options:
+                    print("  No candidates available.\n")
+                    continue
+
+                for i, opt in enumerate(options, 1):
+                    print(f"  {i}) {opt['staff_name']} ({opt['contract_type']}) | score={opt['score']:.1f}")
+                    if opt["blocked_by"]:
+                        for b in opt["blocked_by"]:
+                            print(f"     -> {b}")
+                    else:
+                        print("     -> OK")
+                print()
+
+        return results if return_data else None
+
+    def interactive_cover(self) -> None:
+        """
+        CLI manager flow for covering unfilled slots.
+        Controlled by config["overrides"].
+        """
+        ov = self.cfg.get("overrides", {})
+        allow_overrides = bool(ov.get("allow_overrides", True))
+        interactive = bool(ov.get("interactive_overrides", True))
+        warnings_enabled = bool(ov.get("warnings_enabled", True))
+        require_ack = bool(ov.get("require_warning_ack", False))
+        ack_phrase = str(ov.get("warning_ack_phrase", "I UNDERSTAND"))
+
+        if not interactive:
+            print("\nInteractive overrides are OFF in config. (interactive_overrides=false)")
+            return
+
+        data = self.suggest_cover(return_data=True)
+        if not data:
+            print("\nNo unfilled slots to cover. ✅")
+            return
+
+        print("\n================ INTERACTIVE COVER ================")
+        print("Pick candidates for unfilled slots. Type 's' to skip a slot.\n")
+
+        for item in data:
+            slot: UnfilledSlot = item["slot"]
+            shift_name = item["shift_name"]
+            options = item["options"]
+
+            print(f"UNFILLED -> Date: {item['date']} | Shift: {shift_name} | Role: {item['role']}")
+
+            if not options:
+                print("  No candidates available.\n")
                 continue
 
-            for i, c in enumerate(suggestions, 1):
-                s = self.staff[c.staff_id]
-                print(f"  {i}) {s.name} ({s.contract_type}) | score={c.score:.1f}")
-                if c.blocked_by:
-                    for b in c.blocked_by:
+            for i, opt in enumerate(options, 1):
+                print(f"  {i}) {opt['staff_name']} ({opt['contract_type']}) | score={opt['score']:.1f}")
+                if opt["blocked_by"]:
+                    for b in opt["blocked_by"]:
                         print(f"     -> {b}")
                 else:
                     print("     -> OK")
-            print()
 
-    # ---------- interactive override ----------
+            valid = {str(i) for i in range(1, len(options) + 1)} | {"s"}
+            pick = self._prompt_choice("Pick a number (or 's' to skip): ", valid)
+
+            if pick == "s":
+                print("  Skipped.\n")
+                continue
+
+            chosen = options[int(pick) - 1]
+
+            # No blocks -> assign normally (still uses _apply_assignment so tracking stays correct)
+            if not chosen["blocked_by"]:
+                ok, _ = self._apply_assignment(
+                    sid=chosen["staff_id"],
+                    role=slot.role,
+                    shift=self.shift_templates[slot.shift_id],
+                    date=slot.date,
+                    allow_double_shift_override=False,
+                    allow_consecutive_override=False,
+                )
+                if ok:
+                    try:
+                        self.unfilled.remove(slot)
+                    except ValueError:
+                        pass
+                    print(f"  Assigned: {chosen['staff_name']} ✅\n")
+                else:
+                    print(f"  Could not assign {chosen['staff_name']} (unexpected block). ❌\n")
+                continue
+
+            # Blocked case -> needs override
+            if not allow_overrides:
+                print("  Blocked and overrides are disabled in config. ❌\n")
+                continue
+
+            if not warnings_enabled:
+                # Override without warnings
+                self._apply_cover_assignment(slot, chosen["staff_id"], override=True, override_notes=chosen["blocked_by"])
+                print(f"  Assigned WITH override (warnings disabled): {chosen['staff_name']} ✅\n")
+                continue
+
+            print("\n  WARNING: This choice breaks rule(s):")
+            for b in chosen["blocked_by"]:
+                print(f"   - {b}")
+
+            yn = self._prompt_choice("  Override anyway? (y/n): ", {"y", "n"})
+            if yn == "n":
+                print("  Not overridden.\n")
+                continue
+
+            if require_ack and not self._prompt_ack(ack_phrase):
+                print("  Override cancelled (phrase mismatch).\n")
+                continue
+
+            self._apply_cover_assignment(slot, chosen["staff_id"], override=True, override_notes=chosen["blocked_by"])
+            print(f"  Assigned WITH override: {chosen['staff_name']} ✅\n")
+
+    def _apply_cover_assignment(self, slot: UnfilledSlot, staff_id: str, override: bool, override_notes: List[str]) -> None:
+        """
+        Applies the assignment for a chosen cover candidate, keeping all tracking consistent.
+        Uses _apply_assignment with override flags enabled.
+        """
+        shift = self.shift_templates[slot.shift_id]
+
+        # Determine what override types are needed from notes
+        needs_double = any("Already working that date" in r for r in override_notes)
+        needs_consec = any("Would exceed consecutive" in r for r in override_notes)
+
+        ok, warnings = self._apply_assignment(
+            sid=staff_id,
+            role=slot.role,
+            shift=shift,
+            date=slot.date,
+            allow_double_shift_override=needs_double,
+            allow_consecutive_override=needs_consec,
+        )
+
+        if ok:
+            try:
+                self.unfilled.remove(slot)
+            except ValueError:
+                pass
+
+        if override:
+            notes = "; ".join(override_notes) if override_notes else "override"
+            print(f"  [OVERRIDE LOG] staff_id={staff_id} | date={slot.date} | shift={slot.shift_id} | notes={notes}")
+
+        # If something went wrong (rare), show blocks
+        if not ok:
+            print("  Override failed. Blocks:", "; ".join(warnings))
+
+    # ---------- interactive override (older flow used by generate()) ----------
     def _interactive_override_unfilled(self) -> None:
-        ov = self.cfg["overrides"]
-        warnings_enabled = bool(ov["warnings_enabled"])
+        ov = self.cfg.get("overrides", {})
+        warnings_enabled = bool(ov.get("warnings_enabled", True))
         top_n = int(self.cfg["cover_suggestions"]["top_n"])
 
         print("\n================ OVERRIDE MODE ================")
@@ -620,8 +805,8 @@ class RotaGenerator:
         try:
             from openpyxl import Workbook
         except Exception:
-            if self.cfg["overrides"]["warnings_enabled"]:
-                print("⚠️ Excel export skipped: openpyxl not installed (run: pip install openpyxl)")
+            # keep message simple; not related to override warnings
+            print("⚠️ Excel export skipped: openpyxl not installed (run: pip install openpyxl)")
             return None
 
         wb = Workbook()
@@ -699,7 +884,13 @@ def demo() -> None:
 
     gen.print_daily_rota()
     gen.fairness_report()
-    gen.suggest_cover()
+
+    # You can switch between these two:
+    # gen.suggest_cover()          # just prints suggestions
+    # gen.interactive_cover()      # manager picks options + overrides (CLI)
+    gen.interactive_cover()
+
+
     gen.export_files()
 
 

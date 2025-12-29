@@ -5,10 +5,17 @@
     "max_consecutive_long_days": 3
   },
   "overrides": {
-    "allow_overrides": true,
-    "interactive_overrides": true,
-    "warnings_enabled": true
-  },
+  "allow_overrides": true,
+  "interactive_overrides": true,
+  "warnings_enabled": true,
+
+  "require_warning_ack": true,
+  "warning_ack_phrase": "I UNDERSTAND",
+
+  "allow_double_shift": false,
+  "allow_exceed_consecutive_nights": false,
+  "allow_exceed_consecutive_long_days": false
+},
   "scoring_weights": {
     "hours": 1.0,
     "nights": 15.0,
