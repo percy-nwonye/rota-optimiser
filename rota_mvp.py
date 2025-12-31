@@ -3,7 +3,8 @@
 # - Uses config.json (no code edits needed for rule changes)
 # - CLI overrides (y/n) for now (UI later)
 # - Exports CSV + Excel (Excel auto-skips if openpyxl missing)
-# - NEW: Override logging + export (rota_overrides.csv + Excel Overrides sheet)
+# - Override logging + export (rota_overrides.csv + Excel Overrides sheet)
+# - NEW: Explainability logging + export (rota_explainability.csv)
 
 from __future__ import annotations
 
@@ -84,6 +85,18 @@ class OverrideEvent:
     override_rules: str  # joined string for csv simplicity
 
 
+@dataclass
+class ExplainabilityRecord:
+    date: str
+    shift_id: str
+    shift_name: str
+    role: str
+    chosen_staff_id: str
+    chosen_staff_name: str
+    reason: str
+    considered: List[Dict]
+
+
 # =========================
 # CONFIG LOADING
 # =========================
@@ -102,7 +115,7 @@ def load_config(path: str = "config.json") -> Dict:
             "interactive_overrides": True,
             "warnings_enabled": True,
 
-            # NEW (optional)
+            # optional
             "require_warning_ack": False,
             "warning_ack_phrase": "I UNDERSTAND"
         },
@@ -116,8 +129,11 @@ def load_config(path: str = "config.json") -> Dict:
             "export_csv": True,
             "export_excel": True,
 
-            # NEW: overrides export
-            "export_overrides_csv": True
+            # overrides export
+            "export_overrides_csv": True,
+
+            # NEW: explainability export
+            "export_explainability_csv": True
         },
         "cover_suggestions": {
             "top_n": 3
@@ -200,7 +216,8 @@ class RotaGenerator:
         # outputs
         self.assignments: List[Assignment] = []
         self.unfilled: List[UnfilledSlot] = []
-        self.override_events: List[OverrideEvent] = []  # NEW
+        self.override_events: List[OverrideEvent] = []
+        self.explainability: List[ExplainabilityRecord] = []  # NEW
 
         # tracking workload
         self.staff_hours: Dict[str, float] = {s.id: 0.0 for s in staff}
@@ -378,27 +395,54 @@ class RotaGenerator:
 
         return True, warnings
 
-    # ---------- selection ----------
+    # ---------- selection (NEW explainability snapshot here) ----------
     def _pick_best_candidate(self, role: str, shift: ShiftTemplate, date: str) -> Optional[str]:
-        candidates = []
+        candidates: List[Dict] = []
+
         for sid, s in self.staff.items():
             if s.role != role:
                 continue
-            blocked = self._blocked_reasons(sid, role, shift, date)
-            if not blocked:
-                candidates.append(sid)
 
-        if not candidates:
+            blocked = self._blocked_reasons(sid, role, shift, date)
+            score = float(self._score(sid))
+
+            candidates.append({
+                "staff_id": sid,
+                "name": s.name,
+                "contract_type": s.contract_type,
+                "score": score,
+                "blocked": blocked,
+            })
+
+        valid = [c for c in candidates if not c["blocked"]]
+        if not valid:
             return None
 
-        candidates.sort(key=self._score)
-        return candidates[0]
+        valid.sort(key=lambda c: c["score"])
+        chosen = valid[0]
+
+        # explainability record: we store what we considered + why the chosen won
+        self.explainability.append(
+            ExplainabilityRecord(
+                date=date,
+                shift_id=shift.id,
+                shift_name=shift.name,
+                role=role,
+                chosen_staff_id=chosen["staff_id"],
+                chosen_staff_name=chosen["name"],
+                reason="Lowest fairness score with no rule conflicts",
+                considered=candidates,
+            )
+        )
+
+        return chosen["staff_id"]
 
     # ---------- generation ----------
     def generate(self) -> None:
         self.assignments.clear()
         self.unfilled.clear()
         self.override_events.clear()
+        self.explainability.clear()  # NEW
         self.staff_working_on_date.clear()
         self._assignments_by_date.clear()
 
@@ -644,7 +688,6 @@ class RotaGenerator:
                 pass
 
             if override:
-                # NEW: persist the override event
                 self._log_override(
                     date=slot.date,
                     shift=shift,
@@ -730,7 +773,6 @@ class RotaGenerator:
                 if warnings_enabled and warnings:
                     print("   Applied with warnings:", "; ".join(warnings))
 
-                # NEW: persist override event if warnings were overridden
                 if did_override:
                     self._log_override(
                         date=slot.date,
@@ -784,6 +826,7 @@ class RotaGenerator:
         print(f"Max consecutive nights: {c['max_consecutive_nights']}")
         print(f"Max consecutive long days: {c['max_consecutive_long_days']}")
         print(f"Override events logged: {len(self.override_events)}")
+        print(f"Explainability records: {len(self.explainability)}")
 
     # ---------- exports ----------
     def export_files(self) -> None:
@@ -797,9 +840,11 @@ class RotaGenerator:
         if ex.get("export_csv", True):
             exported_csv = self._export_csv(folder)
 
-            # NEW: export overrides csv if enabled
             if ex.get("export_overrides_csv", True):
                 exported_csv.append(self._export_overrides_csv(folder))
+
+            if ex.get("export_explainability_csv", True):
+                exported_csv.append(self._export_explainability_csv(folder))
 
         if ex.get("export_excel", True):
             exported_excel = self._export_excel(folder)
@@ -874,6 +919,37 @@ class RotaGenerator:
                 ])
         return "rota_overrides.csv"
 
+    def _export_explainability_csv(self, folder: str) -> str:
+        path = os.path.join(folder, "rota_explainability.csv")
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "date",
+                "shift_id",
+                "shift_name",
+                "role",
+                "chosen_staff_id",
+                "chosen_staff_name",
+                "reason",
+                "considered"
+            ])
+            for r in self.explainability:
+                considered_txt = "; ".join(
+                    f"{c['name']}({c['contract_type']}) score={c['score']:.1f} blocked={','.join(c['blocked']) or 'none'}"
+                    for c in r.considered
+                )
+                w.writerow([
+                    r.date,
+                    r.shift_id,
+                    r.shift_name,
+                    r.role,
+                    r.chosen_staff_id,
+                    r.chosen_staff_name,
+                    r.reason,
+                    considered_txt,
+                ])
+        return "rota_explainability.csv"
+
     def _export_excel(self, folder: str) -> Optional[str]:
         try:
             from openpyxl import Workbook
@@ -902,7 +978,6 @@ class RotaGenerator:
         for sid, s in sorted(self.staff.items(), key=lambda kv: kv[1].name.lower()):
             ws3.append([sid, s.name, s.role, s.contract_type, float(f"{self.staff_hours[sid]:.1f}"), self.staff_nights[sid], self.staff_weekends[sid]])
 
-        # NEW: Overrides sheet
         ws4 = wb.create_sheet("Overrides")
         ws4.append([
             "timestamp_utc",
@@ -926,6 +1001,33 @@ class RotaGenerator:
                 e.staff_name,
                 e.contract_type,
                 e.override_rules,
+            ])
+
+        ws5 = wb.create_sheet("Explainability")
+        ws5.append([
+            "date",
+            "shift_id",
+            "shift_name",
+            "role",
+            "chosen_staff_id",
+            "chosen_staff_name",
+            "reason",
+            "considered"
+        ])
+        for r in self.explainability:
+            considered_txt = "; ".join(
+                f"{c['name']}({c['contract_type']}) score={c['score']:.1f} blocked={','.join(c['blocked']) or 'none'}"
+                for c in r.considered
+            )
+            ws5.append([
+                r.date,
+                r.shift_id,
+                r.shift_name,
+                r.role,
+                r.chosen_staff_id,
+                r.chosen_staff_name,
+                r.reason,
+                considered_txt,
             ])
 
         out_path = os.path.join(folder, "rota.xlsx")
