@@ -746,7 +746,8 @@ class RotaGenerator:
             needs_double = any("Already working that date" in r for r in chosen.blocked_by)
             needs_consec = any("Would exceed consecutive" in r for r in chosen.blocked_by)
 
-            did_override = bool(chosen.blocked_by)
+            did_override = True  # manager is intervening to cover an unfilled slot (even if no rule breaks)
+
 
             if warnings_enabled and chosen.blocked_by:
                 ok = ask_yes_no(f"Override warnings for {staff.name}? ({'; '.join(chosen.blocked_by)})")
@@ -779,7 +780,8 @@ class RotaGenerator:
                         shift=shift,
                         role=slot.role,
                         staff_id=chosen.staff_id,
-                        reasons=chosen.blocked_by,
+                        reasons=chosen.blocked_by if chosen.blocked_by else ["Manual cover (no rule break)"],
+
                     )
             else:
                 print(f"❌ Could not assign {staff.name}. Blocks:", "; ".join(warnings))
