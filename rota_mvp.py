@@ -3,6 +3,7 @@
 # - Uses config.json (no code edits needed for rule changes)
 # - CLI overrides (y/n) for now (UI later)
 # - Exports CSV + Excel (Excel auto-skips if openpyxl missing)
+# - NEW: Override logging + export (rota_overrides.csv + Excel Overrides sheet)
 
 from __future__ import annotations
 
@@ -10,7 +11,7 @@ import csv
 import json
 import os
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set, Tuple
 
 DATE_FMT = "%Y-%m-%d"
@@ -70,6 +71,19 @@ class CoverCandidate:
     blocked_by: List[str]  # may be empty
 
 
+@dataclass(frozen=True)
+class OverrideEvent:
+    timestamp_utc: str
+    date: str
+    shift_id: str
+    shift_name: str
+    role: str
+    staff_id: str
+    staff_name: str
+    contract_type: str
+    override_rules: str  # joined string for csv simplicity
+
+
 # =========================
 # CONFIG LOADING
 # =========================
@@ -87,6 +101,8 @@ def load_config(path: str = "config.json") -> Dict:
             "allow_overrides": True,
             "interactive_overrides": True,
             "warnings_enabled": True,
+
+            # NEW (optional)
             "require_warning_ack": False,
             "warning_ack_phrase": "I UNDERSTAND"
         },
@@ -98,7 +114,10 @@ def load_config(path: str = "config.json") -> Dict:
         "exports": {
             "export_folder": ".",
             "export_csv": True,
-            "export_excel": True
+            "export_excel": True,
+
+            # NEW: overrides export
+            "export_overrides_csv": True
         },
         "cover_suggestions": {
             "top_n": 3
@@ -106,7 +125,6 @@ def load_config(path: str = "config.json") -> Dict:
     }
 
     if not os.path.exists(path):
-        # create a default config.json to help you
         with open(path, "w", encoding="utf-8") as f:
             json.dump(defaults, f, indent=2)
         print(f"⚠️  {path} not found, created a default one. You can edit it anytime.")
@@ -115,7 +133,6 @@ def load_config(path: str = "config.json") -> Dict:
     with open(path, "r", encoding="utf-8") as f:
         user_cfg = json.load(f)
 
-    # shallow merge helper (keeps it simple + predictable)
     def merge(d: Dict, u: Dict) -> Dict:
         out = dict(d)
         for k, v in u.items():
@@ -183,6 +200,7 @@ class RotaGenerator:
         # outputs
         self.assignments: List[Assignment] = []
         self.unfilled: List[UnfilledSlot] = []
+        self.override_events: List[OverrideEvent] = []  # NEW
 
         # tracking workload
         self.staff_hours: Dict[str, float] = {s.id: 0.0 for s in staff}
@@ -203,6 +221,10 @@ class RotaGenerator:
         self._assignments_by_date: Dict[str, List[Assignment]] = {}
 
     # ---------- helpers ----------
+    @staticmethod
+    def _now_utc_iso() -> str:
+        return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
     @staticmethod
     def _is_weekend(date_str: str) -> bool:
         return datetime.strptime(date_str, DATE_FMT).weekday() >= 5
@@ -227,6 +249,23 @@ class RotaGenerator:
             self.staff_hours[staff_id] * float(w.get("hours", 1.0))
             + self.staff_nights[staff_id] * float(w.get("nights", 15.0))
             + self.staff_weekends[staff_id] * float(w.get("weekends", 10.0))
+        )
+
+    def _log_override(self, *, date: str, shift: ShiftTemplate, role: str, staff_id: str, reasons: List[str]) -> None:
+        s = self.staff[staff_id]
+        joined = "; ".join(reasons) if reasons else "override"
+        self.override_events.append(
+            OverrideEvent(
+                timestamp_utc=self._now_utc_iso(),
+                date=date,
+                shift_id=shift.id,
+                shift_name=shift.name,
+                role=role,
+                staff_id=staff_id,
+                staff_name=s.name,
+                contract_type=s.contract_type,
+                override_rules=joined,
+            )
         )
 
     # ---------- constraint checks ----------
@@ -260,21 +299,17 @@ class RotaGenerator:
         reasons: List[str] = []
         s = self.staff[sid]
 
-        # hard: role mismatch
         if s.role != role:
             reasons.append("Role mismatch")
 
-        # hard: cannot do nights (NON-OVERRIDABLE)
         if shift.is_night and not s.can_do_nights:
             reasons.append("Cannot do nights (NON-OVERRIDABLE)")
 
-        # 1 shift per day (soft)
         if c["one_shift_per_day"] and not ignore_one_shift_per_day:
             already = self.staff_working_on_date.get(date, set())
             if sid in already:
                 reasons.append("Already working that date (double shift)")
 
-        # consecutive rules (soft)
         if not ignore_consecutive_rules:
             if shift.is_night:
                 proj = self._projected_night_streak(sid, date)
@@ -304,20 +339,16 @@ class RotaGenerator:
             ignore_consecutive_rules=allow_consecutive_override,
         )
 
-        # if any NON-OVERRIDABLE, fail
         if any("NON-OVERRIDABLE" in r for r in reasons):
             return False, reasons
 
-        warnings = reasons[:]  # may be empty
+        warnings = reasons[:]
 
-        # record
         self.assignments.append(Assignment(date=date, shift_id=shift.id, role=role, staff_id=sid))
         self._assignments_by_date.setdefault(date, []).append(self.assignments[-1])
 
-        # mark working
         self.staff_working_on_date.setdefault(date, set()).add(sid)
 
-        # update workload
         hours = self._shift_hours(shift)
         self.staff_hours[sid] += hours
         if shift.is_night:
@@ -325,7 +356,6 @@ class RotaGenerator:
         if self._is_weekend(date):
             self.staff_weekends[sid] += 1
 
-        # update streaks
         prev = self.last_date[sid]
         is_next = prev is not None and self._is_next_day(prev, date)
 
@@ -366,11 +396,12 @@ class RotaGenerator:
 
     # ---------- generation ----------
     def generate(self) -> None:
-        # reset
         self.assignments.clear()
         self.unfilled.clear()
+        self.override_events.clear()
         self.staff_working_on_date.clear()
         self._assignments_by_date.clear()
+
         for sid in self.staff.keys():
             self.staff_hours[sid] = 0.0
             self.staff_nights[sid] = 0
@@ -381,7 +412,6 @@ class RotaGenerator:
             self.last_shift_was_night[sid] = False
             self.last_shift_was_long[sid] = False
 
-        # process requirements in date order
         reqs = sorted(self.requirements, key=lambda r: (r.date, r.shift_id, r.role))
 
         for req in reqs:
@@ -406,7 +436,6 @@ class RotaGenerator:
                         reason="Candidate blocked (unexpected) under constraints"
                     ))
 
-        # interactive overrides (for unfilled slots) - uses the older override flow
         ov = self.cfg.get("overrides", {})
         if ov.get("allow_overrides", True) and ov.get("interactive_overrides", True) and self.unfilled:
             self._interactive_override_unfilled()
@@ -420,17 +449,14 @@ class RotaGenerator:
             if s.role != slot.role:
                 continue
             blocked = self._blocked_reasons(sid, slot.role, shift, slot.date)
-
-            # exclude NON-OVERRIDABLE completely
             if any("NON-OVERRIDABLE" in r for r in blocked):
                 continue
-
             candidates.append(CoverCandidate(staff_id=sid, score=self._score(sid), blocked_by=blocked))
 
         candidates.sort(key=lambda c: c.score)
         return candidates[:top_n]
 
-    # ---------- interactive helpers (inside class) ----------
+    # ---------- interactive helpers ----------
     @staticmethod
     def _prompt_choice(prompt: str, valid: Set[str]) -> str:
         while True:
@@ -445,10 +471,6 @@ class RotaGenerator:
         return ans == phrase
 
     def suggest_cover(self, return_data: bool = False):
-        """
-        Print cover suggestions for unfilled slots.
-        If return_data=True, returns structured data for UI later.
-        """
         top_n = int(self.cfg["cover_suggestions"]["top_n"])
 
         if not self.unfilled:
@@ -508,10 +530,6 @@ class RotaGenerator:
         return results if return_data else None
 
     def interactive_cover(self) -> None:
-        """
-        CLI manager flow for covering unfilled slots.
-        Controlled by config["overrides"].
-        """
         ov = self.cfg.get("overrides", {})
         allow_overrides = bool(ov.get("allow_overrides", True))
         interactive = bool(ov.get("interactive_overrides", True))
@@ -558,13 +576,13 @@ class RotaGenerator:
                 continue
 
             chosen = options[int(pick) - 1]
+            shift = self.shift_templates[slot.shift_id]
 
-            # No blocks -> assign normally (still uses _apply_assignment so tracking stays correct)
             if not chosen["blocked_by"]:
                 ok, _ = self._apply_assignment(
                     sid=chosen["staff_id"],
                     role=slot.role,
-                    shift=self.shift_templates[slot.shift_id],
+                    shift=shift,
                     date=slot.date,
                     allow_double_shift_override=False,
                     allow_consecutive_override=False,
@@ -579,13 +597,11 @@ class RotaGenerator:
                     print(f"  Could not assign {chosen['staff_name']} (unexpected block). ❌\n")
                 continue
 
-            # Blocked case -> needs override
             if not allow_overrides:
                 print("  Blocked and overrides are disabled in config. ❌\n")
                 continue
 
             if not warnings_enabled:
-                # Override without warnings
                 self._apply_cover_assignment(slot, chosen["staff_id"], override=True, override_notes=chosen["blocked_by"])
                 print(f"  Assigned WITH override (warnings disabled): {chosen['staff_name']} ✅\n")
                 continue
@@ -607,13 +623,8 @@ class RotaGenerator:
             print(f"  Assigned WITH override: {chosen['staff_name']} ✅\n")
 
     def _apply_cover_assignment(self, slot: UnfilledSlot, staff_id: str, override: bool, override_notes: List[str]) -> None:
-        """
-        Applies the assignment for a chosen cover candidate, keeping all tracking consistent.
-        Uses _apply_assignment with override flags enabled.
-        """
         shift = self.shift_templates[slot.shift_id]
 
-        # Determine what override types are needed from notes
         needs_double = any("Already working that date" in r for r in override_notes)
         needs_consec = any("Would exceed consecutive" in r for r in override_notes)
 
@@ -632,11 +643,20 @@ class RotaGenerator:
             except ValueError:
                 pass
 
+            if override:
+                # NEW: persist the override event
+                self._log_override(
+                    date=slot.date,
+                    shift=shift,
+                    role=slot.role,
+                    staff_id=staff_id,
+                    reasons=override_notes,
+                )
+
         if override:
             notes = "; ".join(override_notes) if override_notes else "override"
             print(f"  [OVERRIDE LOG] staff_id={staff_id} | date={slot.date} | shift={slot.shift_id} | notes={notes}")
 
-        # If something went wrong (rare), show blocks
         if not ok:
             print("  Override failed. Blocks:", "; ".join(warnings))
 
@@ -644,6 +664,8 @@ class RotaGenerator:
     def _interactive_override_unfilled(self) -> None:
         ov = self.cfg.get("overrides", {})
         warnings_enabled = bool(ov.get("warnings_enabled", True))
+        require_ack = bool(ov.get("require_warning_ack", False))
+        ack_phrase = str(ov.get("warning_ack_phrase", "I UNDERSTAND"))
         top_n = int(self.cfg["cover_suggestions"]["top_n"])
 
         print("\n================ OVERRIDE MODE ================")
@@ -681,9 +703,16 @@ class RotaGenerator:
             needs_double = any("Already working that date" in r for r in chosen.blocked_by)
             needs_consec = any("Would exceed consecutive" in r for r in chosen.blocked_by)
 
+            did_override = bool(chosen.blocked_by)
+
             if warnings_enabled and chosen.blocked_by:
                 ok = ask_yes_no(f"Override warnings for {staff.name}? ({'; '.join(chosen.blocked_by)})")
                 if not ok:
+                    remaining.append(slot)
+                    continue
+
+                if require_ack and not self._prompt_ack(ack_phrase):
+                    print("Override cancelled (phrase mismatch).")
                     remaining.append(slot)
                     continue
 
@@ -700,6 +729,16 @@ class RotaGenerator:
                 print(f"✅ Covered -> {slot.date} {shift.name} {slot.role}: {staff.name}")
                 if warnings_enabled and warnings:
                     print("   Applied with warnings:", "; ".join(warnings))
+
+                # NEW: persist override event if warnings were overridden
+                if did_override:
+                    self._log_override(
+                        date=slot.date,
+                        shift=shift,
+                        role=slot.role,
+                        staff_id=chosen.staff_id,
+                        reasons=chosen.blocked_by,
+                    )
             else:
                 print(f"❌ Could not assign {staff.name}. Blocks:", "; ".join(warnings))
                 remaining.append(slot)
@@ -744,6 +783,7 @@ class RotaGenerator:
         print(f"\nUnfilled slots: {len(self.unfilled)}")
         print(f"Max consecutive nights: {c['max_consecutive_nights']}")
         print(f"Max consecutive long days: {c['max_consecutive_long_days']}")
+        print(f"Override events logged: {len(self.override_events)}")
 
     # ---------- exports ----------
     def export_files(self) -> None:
@@ -754,10 +794,14 @@ class RotaGenerator:
         exported_csv = []
         exported_excel = None
 
-        if ex["export_csv"]:
+        if ex.get("export_csv", True):
             exported_csv = self._export_csv(folder)
 
-        if ex["export_excel"]:
+            # NEW: export overrides csv if enabled
+            if ex.get("export_overrides_csv", True):
+                exported_csv.append(self._export_overrides_csv(folder))
+
+        if ex.get("export_excel", True):
             exported_excel = self._export_excel(folder)
 
         if exported_csv:
@@ -801,11 +845,39 @@ class RotaGenerator:
 
         return out
 
+    def _export_overrides_csv(self, folder: str) -> str:
+        path = os.path.join(folder, "rota_overrides.csv")
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "timestamp_utc",
+                "date",
+                "shift_id",
+                "shift_name",
+                "role",
+                "staff_id",
+                "staff_name",
+                "contract_type",
+                "override_rules"
+            ])
+            for e in self.override_events:
+                w.writerow([
+                    e.timestamp_utc,
+                    e.date,
+                    e.shift_id,
+                    e.shift_name,
+                    e.role,
+                    e.staff_id,
+                    e.staff_name,
+                    e.contract_type,
+                    e.override_rules,
+                ])
+        return "rota_overrides.csv"
+
     def _export_excel(self, folder: str) -> Optional[str]:
         try:
             from openpyxl import Workbook
         except Exception:
-            # keep message simple; not related to override warnings
             print("⚠️ Excel export skipped: openpyxl not installed (run: pip install openpyxl)")
             return None
 
@@ -830,6 +902,32 @@ class RotaGenerator:
         for sid, s in sorted(self.staff.items(), key=lambda kv: kv[1].name.lower()):
             ws3.append([sid, s.name, s.role, s.contract_type, float(f"{self.staff_hours[sid]:.1f}"), self.staff_nights[sid], self.staff_weekends[sid]])
 
+        # NEW: Overrides sheet
+        ws4 = wb.create_sheet("Overrides")
+        ws4.append([
+            "timestamp_utc",
+            "date",
+            "shift_id",
+            "shift_name",
+            "role",
+            "staff_id",
+            "staff_name",
+            "contract_type",
+            "override_rules"
+        ])
+        for e in self.override_events:
+            ws4.append([
+                e.timestamp_utc,
+                e.date,
+                e.shift_id,
+                e.shift_name,
+                e.role,
+                e.staff_id,
+                e.staff_name,
+                e.contract_type,
+                e.override_rules,
+            ])
+
         out_path = os.path.join(folder, "rota.xlsx")
         wb.save(out_path)
         return "rota.xlsx"
@@ -844,12 +942,10 @@ def demo() -> None:
     print("Running demo rota...")
     print("Config loaded from config.json")
 
-    # shifts
     long_day = ShiftTemplate("long", "Long Day", "08:00", "20:00", False)
     night = ShiftTemplate("night", "Night", "20:00", "08:00", True)
     shifts = {"long": long_day, "night": night}
 
-    # staff (10)
     staff = [
         Staff("s1", "Amaka", "HCA", "permanent", 44, True),
         Staff("s2", "James", "HCA", "permanent", 44, True),
@@ -863,7 +959,6 @@ def demo() -> None:
         Staff("s10", "Zara", "Senior", "bank", 0, False),
     ]
 
-    # requirements (7 days)
     requirements: List[Requirement] = []
     start = datetime.strptime("2025-01-06", DATE_FMT)
     for i in range(7):
@@ -885,11 +980,9 @@ def demo() -> None:
     gen.print_daily_rota()
     gen.fairness_report()
 
-    # You can switch between these two:
-    # gen.suggest_cover()          # just prints suggestions
-    # gen.interactive_cover()      # manager picks options + overrides (CLI)
-    gen.interactive_cover()
-
+    # For manager-driven selection, switch to:
+    # gen.interactive_cover()
+    gen.suggest_cover()
 
     gen.export_files()
 
