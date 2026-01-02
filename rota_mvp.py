@@ -1,10 +1,11 @@
 # rota_mvp.py
-# FULL REPLACEMENT FILE (Option B: config file driven)
-# - Uses config.json (no code edits needed for rule changes)
-# - CLI overrides (y/n) for now (UI later)
-# - Exports CSV + Excel (Excel auto-skips if openpyxl missing)
-# - Override logging + export (rota_overrides.csv + Excel Overrides sheet)
-# - NEW: Explainability logging + export (rota_explainability.csv + Excel Explainability sheet)
+# FULL REPLACEMENT FILE (config-driven)
+# - Uses config.json
+# - Generates rota, tracks fairness
+# - Cover suggestions + interactive override mode
+# - Exports CSV + Excel
+# - Override logging with STRUCTURED FLAGS (is_override, manual cover, double shift, consecutive)
+# - Explainability logging + export (rota_explainability.csv + Excel sheet)
 
 from __future__ import annotations
 
@@ -36,7 +37,7 @@ class Staff:
     id: str
     name: str
     role: str
-    contract_type: str  # "permanent" or "bank"
+    contract_type: str   # "permanent" or "bank"
     target_hours_per_week: int
     can_do_nights: bool
 
@@ -69,9 +70,10 @@ class UnfilledSlot:
 class CoverCandidate:
     staff_id: str
     score: float
-    blocked_by: List[str]  # may be empty
+    blocked_by: List[str]
 
 
+# NEW: structured override logging
 @dataclass(frozen=True)
 class OverrideEvent:
     timestamp_utc: str
@@ -82,22 +84,31 @@ class OverrideEvent:
     staff_id: str
     staff_name: str
     contract_type: str
-    override_rules: str  # joined string for csv simplicity
+
+    # flags
+    is_override: bool
+    is_manual_cover: bool
+    override_double_shift: bool
+    override_consecutive: bool
+
+    # readable explanation
+    override_reason_text: str
 
 
+# NEW: explainability logging
 @dataclass(frozen=True)
-class ExplainabilityEvent:
+class ExplainabilityRecord:
     timestamp_utc: str
     date: str
     shift_id: str
     shift_name: str
     role: str
-    outcome: str  # "ASSIGNED" | "UNFILLED" | "OVERRIDE_ASSIGNED"
-    chosen_staff_id: str
-    chosen_staff_name: str
-    chosen_score: str
-    chosen_notes: str
-    candidates_summary: str  # short human-readable list
+    decision: str  # ASSIGNED / UNFILLED / MANUAL_COVER / OVERRIDE_ASSIGNED
+    staff_id: str
+    staff_name: str
+    contract_type: str
+    score: float
+    notes: str
 
 
 # =========================
@@ -114,6 +125,8 @@ def load_config(path: str = "config.json") -> Dict:
             "allow_overrides": True,
             "interactive_overrides": True,
             "warnings_enabled": True,
+
+            # optional
             "require_warning_ack": False,
             "warning_ack_phrase": "I UNDERSTAND"
         },
@@ -126,15 +139,12 @@ def load_config(path: str = "config.json") -> Dict:
             "export_folder": ".",
             "export_csv": True,
             "export_excel": True,
+
             "export_overrides_csv": True,
             "export_explainability_csv": True
         },
         "cover_suggestions": {
             "top_n": 3
-        },
-        "explainability": {
-            "enabled": True,
-            "top_n_candidates": 5
         }
     }
 
@@ -160,7 +170,7 @@ def load_config(path: str = "config.json") -> Dict:
 
 
 # =========================
-# CLI HELPERS (UI later)
+# CLI HELPERS
 # =========================
 def ask_yes_no(prompt: str, default_no: bool = True) -> bool:
     suffix = " [y/N]: " if default_no else " [Y/n]: "
@@ -215,7 +225,7 @@ class RotaGenerator:
         self.assignments: List[Assignment] = []
         self.unfilled: List[UnfilledSlot] = []
         self.override_events: List[OverrideEvent] = []
-        self.explainability_events: List[ExplainabilityEvent] = []
+        self.explainability: List[ExplainabilityRecord] = []
 
         # tracking workload
         self.staff_hours: Dict[str, float] = {s.id: 0.0 for s in staff}
@@ -266,9 +276,54 @@ class RotaGenerator:
             + self.staff_weekends[staff_id] * float(w.get("weekends", 10.0))
         )
 
-    def _log_override(self, *, date: str, shift: ShiftTemplate, role: str, staff_id: str, reasons: List[str]) -> None:
+    def _log_explainability(
+        self,
+        *,
+        date: str,
+        shift: ShiftTemplate,
+        role: str,
+        decision: str,
+        staff_id: str,
+        score: float,
+        notes: str,
+    ) -> None:
+        s = self.staff.get(staff_id)
+        staff_name = s.name if s else ""
+        contract = s.contract_type if s else ""
+        self.explainability.append(
+            ExplainabilityRecord(
+                timestamp_utc=self._now_utc_iso(),
+                date=date,
+                shift_id=shift.id,
+                shift_name=shift.name,
+                role=role,
+                decision=decision,
+                staff_id=staff_id,
+                staff_name=staff_name,
+                contract_type=contract,
+                score=float(score),
+                notes=notes,
+            )
+        )
+
+    def _log_override_structured(
+        self,
+        *,
+        date: str,
+        shift: ShiftTemplate,
+        role: str,
+        staff_id: str,
+        is_manual_cover: bool,
+        blocked_reasons: List[str],
+    ) -> None:
         s = self.staff[staff_id]
-        joined = "; ".join(reasons) if reasons else "override"
+
+        override_double = any("Already working that date" in r for r in blocked_reasons)
+        override_consec = any("Would exceed consecutive" in r for r in blocked_reasons)
+
+        is_override = bool(blocked_reasons)  # rule(s) actually broken
+        reason_text = "; ".join(blocked_reasons) if blocked_reasons else "Manual cover (no rules broken)"
+
         self.override_events.append(
             OverrideEvent(
                 timestamp_utc=self._now_utc_iso(),
@@ -279,58 +334,11 @@ class RotaGenerator:
                 staff_id=staff_id,
                 staff_name=s.name,
                 contract_type=s.contract_type,
-                override_rules=joined,
-            )
-        )
-
-    def _log_explainability(
-        self,
-        *,
-        date: str,
-        shift: ShiftTemplate,
-        role: str,
-        outcome: str,
-        chosen_id: Optional[str],
-        chosen_notes: str,
-        candidates: List[Tuple[str, float, List[str]]],
-    ) -> None:
-        ex_cfg = self.cfg.get("explainability", {})
-        if not bool(ex_cfg.get("enabled", True)):
-            return
-
-        top_n = int(ex_cfg.get("top_n_candidates", 5))
-
-        # build a short summary: "1) Name|score|OK; 2) Name|score|Blocked: ...;"
-        parts: List[str] = []
-        for i, (sid, sc, blocked) in enumerate(candidates[:top_n], 1):
-            s = self.staff[sid]
-            status = "OK" if not blocked else "Blocked: " + "; ".join(blocked)
-            parts.append(f"{i}) {s.name} ({s.contract_type})|{sc:.1f}|{status}")
-        summary = " ; ".join(parts)
-
-        if chosen_id is None:
-            chosen_staff_id = ""
-            chosen_staff_name = ""
-            chosen_score = ""
-        else:
-            cs = self.staff[chosen_id]
-            chosen_staff_id = chosen_id
-            chosen_staff_name = cs.name
-            chosen_score = f"{self._score(chosen_id):.1f}"
-
-        self.explainability_events.append(
-            ExplainabilityEvent(
-                timestamp_utc=self._now_utc_iso(),
-                date=date,
-                shift_id=shift.id,
-                shift_name=shift.name,
-                role=role,
-                outcome=outcome,
-                chosen_staff_id=chosen_staff_id,
-                chosen_staff_name=chosen_staff_name,
-                chosen_score=chosen_score,
-                chosen_notes=chosen_notes,
-                candidates_summary=summary,
+                is_override=is_override,
+                is_manual_cover=is_manual_cover,
+                override_double_shift=override_double,
+                override_consecutive=override_consec,
+                override_reason_text=reason_text,
             )
         )
 
@@ -387,18 +395,6 @@ class RotaGenerator:
                     reasons.append(f"Would exceed consecutive long days ({proj} > {c['max_consecutive_long_days']})")
 
         return reasons
-
-    # ---------- candidate ranking (for explainability) ----------
-    def _rank_candidates(self, role: str, shift: ShiftTemplate, date: str) -> List[Tuple[str, float, List[str]]]:
-        ranked: List[Tuple[str, float, List[str]]] = []
-        for sid, s in self.staff.items():
-            if s.role != role:
-                continue
-            blocked = self._blocked_reasons(sid, role, shift, date)
-            sc = self._score(sid)
-            ranked.append((sid, sc, blocked))
-        ranked.sort(key=lambda t: t[1])
-        return ranked
 
     # ---------- assignment apply ----------
     def _apply_assignment(
@@ -458,18 +454,26 @@ class RotaGenerator:
 
     # ---------- selection ----------
     def _pick_best_candidate(self, role: str, shift: ShiftTemplate, date: str) -> Optional[str]:
-        ranked = self._rank_candidates(role, shift, date)
-        for sid, _sc, blocked in ranked:
+        candidates = []
+        for sid, s in self.staff.items():
+            if s.role != role:
+                continue
+            blocked = self._blocked_reasons(sid, role, shift, date)
             if not blocked:
-                return sid
-        return None
+                candidates.append(sid)
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=self._score)
+        return candidates[0]
 
     # ---------- generation ----------
     def generate(self) -> None:
         self.assignments.clear()
         self.unfilled.clear()
         self.override_events.clear()
-        self.explainability_events.clear()
+        self.explainability.clear()
         self.staff_working_on_date.clear()
         self._assignments_by_date.clear()
 
@@ -487,15 +491,8 @@ class RotaGenerator:
 
         for req in reqs:
             shift = self.shift_templates[req.shift_id]
-
             for _ in range(req.required):
-                ranked = self._rank_candidates(req.role, shift, req.date)
-                chosen = None
-                for sid, _sc, blocked in ranked:
-                    if not blocked:
-                        chosen = sid
-                        break
-
+                chosen = self._pick_best_candidate(req.role, shift, req.date)
                 if chosen is None:
                     self.unfilled.append(UnfilledSlot(
                         date=req.date,
@@ -503,27 +500,21 @@ class RotaGenerator:
                         role=req.role,
                         reason="No valid candidate under constraints"
                     ))
+                    # explainability: unfilled
                     self._log_explainability(
-                        date=req.date,
-                        shift=shift,
-                        role=req.role,
-                        outcome="UNFILLED",
-                        chosen_id=None,
-                        chosen_notes="No valid candidate under constraints",
-                        candidates=ranked,
+                        date=req.date, shift=shift, role=req.role,
+                        decision="UNFILLED", staff_id="", score=0.0,
+                        notes="No valid candidate under constraints"
                     )
                     continue
 
                 ok, warnings = self._apply_assignment(chosen, req.role, shift, req.date)
                 if ok:
+                    s = self.staff[chosen]
                     self._log_explainability(
-                        date=req.date,
-                        shift=shift,
-                        role=req.role,
-                        outcome="ASSIGNED",
-                        chosen_id=chosen,
-                        chosen_notes="Chosen as best valid candidate (lowest fairness score).",
-                        candidates=ranked,
+                        date=req.date, shift=shift, role=req.role,
+                        decision="ASSIGNED", staff_id=chosen, score=self._score(chosen),
+                        notes="OK" if not warnings else "; ".join(warnings)
                     )
                 else:
                     self.unfilled.append(UnfilledSlot(
@@ -533,13 +524,9 @@ class RotaGenerator:
                         reason="Candidate blocked (unexpected) under constraints"
                     ))
                     self._log_explainability(
-                        date=req.date,
-                        shift=shift,
-                        role=req.role,
-                        outcome="UNFILLED",
-                        chosen_id=chosen,
-                        chosen_notes="Unexpected: candidate blocked when applying assignment.",
-                        candidates=ranked,
+                        date=req.date, shift=shift, role=req.role,
+                        decision="UNFILLED", staff_id="", score=0.0,
+                        notes="Candidate blocked unexpectedly"
                     )
 
         ov = self.cfg.get("overrides", {})
@@ -562,80 +549,36 @@ class RotaGenerator:
         candidates.sort(key=lambda c: c.score)
         return candidates[:top_n]
 
-    # ---------- interactive helpers ----------
-    @staticmethod
-    def _prompt_choice(prompt: str, valid: Set[str]) -> str:
-        while True:
-            ans = input(prompt).strip().lower()
-            if ans in valid:
-                return ans
-            print(f"Please type one of: {', '.join(sorted(valid))}")
-
-    @staticmethod
-    def _prompt_ack(phrase: str) -> bool:
-        ans = input(f"Type '{phrase}' to confirm: ").strip()
-        return ans == phrase
-
-    def suggest_cover(self, return_data: bool = False):
+    def suggest_cover(self) -> None:
         top_n = int(self.cfg["cover_suggestions"]["top_n"])
-
         if not self.unfilled:
-            if not return_data:
-                print("\n================ COVER SUGGESTIONS ================")
-                print("No unfilled slots. ✅")
-            return [] if return_data else None
-
-        results = []
-        if not return_data:
             print("\n================ COVER SUGGESTIONS ================")
-            print("Best candidates for UNFILLED slots + what blocks them.")
-            print("Note: Cannot do nights is NON-OVERRIDABLE.\n")
+            print("No unfilled slots. ✅")
+            return
+
+        print("\n================ COVER SUGGESTIONS ================")
+        print("Best candidates for UNFILLED slots + what blocks them.")
+        print("Note: Cannot do nights is NON-OVERRIDABLE.\n")
 
         for slot in self.unfilled:
             shift = self.shift_templates[slot.shift_id]
+            print(f"UNFILLED -> Date: {slot.date} | Shift: {shift.name} | Role: {slot.role}")
             suggestions = self._suggest_for_slot(slot, top_n=top_n)
+            if not suggestions:
+                print("  No candidates available.\n")
+                continue
 
-            options = []
-            for c in suggestions or []:
+            for i, c in enumerate(suggestions, 1):
                 s = self.staff[c.staff_id]
-                options.append(
-                    {
-                        "staff_id": c.staff_id,
-                        "staff_name": s.name,
-                        "contract_type": s.contract_type,
-                        "score": float(c.score),
-                        "blocked_by": list(c.blocked_by) if c.blocked_by else [],
-                    }
-                )
+                print(f"  {i}) {s.name} ({s.contract_type}) | score={c.score:.1f}")
+                if c.blocked_by:
+                    for b in c.blocked_by:
+                        print(f"     -> {b}")
+                else:
+                    print("     -> OK")
+            print()
 
-            results.append(
-                {
-                    "slot": slot,
-                    "shift_name": shift.name,
-                    "role": slot.role,
-                    "date": slot.date,
-                    "options": options,
-                }
-            )
-
-            if not return_data:
-                print(f"UNFILLED -> Date: {slot.date} | Shift: {shift.name} | Role: {slot.role}")
-                if not options:
-                    print("  No candidates available.\n")
-                    continue
-
-                for i, opt in enumerate(options, 1):
-                    print(f"  {i}) {opt['staff_name']} ({opt['contract_type']}) | score={opt['score']:.1f}")
-                    if opt["blocked_by"]:
-                        for b in opt["blocked_by"]:
-                            print(f"     -> {b}")
-                    else:
-                        print("     -> OK")
-                print()
-
-        return results if return_data else None
-
-    # ---------- interactive override (used by generate()) ----------
+    # ---------- interactive override ----------
     def _interactive_override_unfilled(self) -> None:
         ov = self.cfg.get("overrides", {})
         warnings_enabled = bool(ov.get("warnings_enabled", True))
@@ -678,19 +621,19 @@ class RotaGenerator:
             needs_double = any("Already working that date" in r for r in chosen.blocked_by)
             needs_consec = any("Would exceed consecutive" in r for r in chosen.blocked_by)
 
-            # IMPORTANT: any assignment here is a manager intervention (even if no rule breaks)
-            did_override = True
-
+            # If there are warnings, ask for confirmation
             if warnings_enabled and chosen.blocked_by:
                 ok = ask_yes_no(f"Override warnings for {staff.name}? ({'; '.join(chosen.blocked_by)})")
                 if not ok:
                     remaining.append(slot)
                     continue
 
-                if require_ack and not self._prompt_ack(ack_phrase):
-                    print("Override cancelled (phrase mismatch).")
-                    remaining.append(slot)
-                    continue
+                if require_ack:
+                    typed = input(f"Type '{ack_phrase}' to confirm: ").strip()
+                    if typed != ack_phrase:
+                        print("Override cancelled (phrase mismatch).")
+                        remaining.append(slot)
+                        continue
 
             ok, warnings = self._apply_assignment(
                 sid=chosen.staff_id,
@@ -703,30 +646,26 @@ class RotaGenerator:
 
             if ok:
                 print(f"✅ Covered -> {slot.date} {shift.name} {slot.role}: {staff.name}")
-                if warnings_enabled and warnings:
-                    print("   Applied with warnings:", "; ".join(warnings))
 
-                # log override
-                if did_override:
-                    self._log_override(
-                        date=slot.date,
-                        shift=shift,
-                        role=slot.role,
-                        staff_id=chosen.staff_id,
-                        reasons=chosen.blocked_by if chosen.blocked_by else ["Manual cover (no rule break)"],
-                    )
-
-                # also log explainability for this manual cover (use ranked list)
-                ranked = self._rank_candidates(slot.role, shift, slot.date)
+                # explainability: manual cover event (always)
                 self._log_explainability(
+                    date=slot.date, shift=shift, role=slot.role,
+                    decision="MANUAL_COVER" if not chosen.blocked_by else "OVERRIDE_ASSIGNED",
+                    staff_id=chosen.staff_id, score=self._score(chosen.staff_id),
+                    notes="OK" if not chosen.blocked_by else "; ".join(chosen.blocked_by)
+                )
+
+                # structured override logging: ALWAYS log manual cover in override mode
+                # is_override True only when rules were broken (blocked_by not empty)
+                self._log_override_structured(
                     date=slot.date,
                     shift=shift,
                     role=slot.role,
-                    outcome="OVERRIDE_ASSIGNED",
-                    chosen_id=chosen.staff_id,
-                    chosen_notes="Manager covered an unfilled slot via override mode.",
-                    candidates=ranked,
+                    staff_id=chosen.staff_id,
+                    is_manual_cover=True,
+                    blocked_reasons=chosen.blocked_by,
                 )
+
             else:
                 print(f"❌ Could not assign {staff.name}. Blocks:", "; ".join(warnings))
                 remaining.append(slot)
@@ -771,8 +710,11 @@ class RotaGenerator:
         print(f"\nUnfilled slots: {len(self.unfilled)}")
         print(f"Max consecutive nights: {c['max_consecutive_nights']}")
         print(f"Max consecutive long days: {c['max_consecutive_long_days']}")
-        print(f"Override events logged: {len(self.override_events)}")
-        print(f"Explainability records: {len(self.explainability_events)}")
+        total_events = len(self.override_events)
+        true_overrides = sum(1 for e in self.override_events if getattr(e, "is_override", False))
+        manual_covers = sum(1 for e in self.override_events if getattr(e, "is_manual_cover", False))
+        print(f"Logged events: {total_events} | Manual covers: {manual_covers} | True overrides: {true_overrides}")
+        print(f"Explainability records: {len(self.explainability)}")
 
     # ---------- exports ----------
     def export_files(self) -> None:
@@ -780,32 +722,32 @@ class RotaGenerator:
         folder = ex["export_folder"]
         os.makedirs(folder, exist_ok=True)
 
-        exported_csv: List[str] = []
-        exported_excel: Optional[str] = None
+        exported = []
 
         if ex.get("export_csv", True):
-            exported_csv.extend(self._export_csv(folder))
+            exported += self._export_csv(folder)
 
             if ex.get("export_overrides_csv", True):
-                exported_csv.append(self._export_overrides_csv(folder))
+                exported.append(self._export_overrides_csv(folder))
 
             if ex.get("export_explainability_csv", True):
-                exported_csv.append(self._export_explainability_csv(folder))
+                exported.append(self._export_explainability_csv(folder))
 
+        excel_file = None
         if ex.get("export_excel", True):
-            exported_excel = self._export_excel(folder)
+            excel_file = self._export_excel(folder)
 
-        if exported_csv:
+        if exported:
             print("✅ CSV files exported:")
-            for f in exported_csv:
+            for f in exported:
                 print(f" - {f}")
 
-        if exported_excel:
+        if excel_file:
             print("✅ Excel exported:")
-            print(f" - {exported_excel}")
+            print(f" - {excel_file}")
 
     def _export_csv(self, folder: str) -> List[str]:
-        out: List[str] = []
+        out = []
 
         a_path = os.path.join(folder, "rota_assignments.csv")
         with open(a_path, "w", newline="", encoding="utf-8") as f:
@@ -849,7 +791,11 @@ class RotaGenerator:
                 "staff_id",
                 "staff_name",
                 "contract_type",
-                "override_rules"
+                "is_override",
+                "is_manual_cover",
+                "override_double_shift",
+                "override_consecutive",
+                "override_reason_text",
             ])
             for e in self.override_events:
                 w.writerow([
@@ -861,7 +807,11 @@ class RotaGenerator:
                     e.staff_id,
                     e.staff_name,
                     e.contract_type,
-                    e.override_rules,
+                    e.is_override,
+                    e.is_manual_cover,
+                    e.override_double_shift,
+                    e.override_consecutive,
+                    e.override_reason_text,
                 ])
         return "rota_overrides.csv"
 
@@ -875,26 +825,26 @@ class RotaGenerator:
                 "shift_id",
                 "shift_name",
                 "role",
-                "outcome",
-                "chosen_staff_id",
-                "chosen_staff_name",
-                "chosen_score",
-                "chosen_notes",
-                "candidates_summary"
+                "decision",
+                "staff_id",
+                "staff_name",
+                "contract_type",
+                "score",
+                "notes",
             ])
-            for e in self.explainability_events:
+            for r in self.explainability:
                 w.writerow([
-                    e.timestamp_utc,
-                    e.date,
-                    e.shift_id,
-                    e.shift_name,
-                    e.role,
-                    e.outcome,
-                    e.chosen_staff_id,
-                    e.chosen_staff_name,
-                    e.chosen_score,
-                    e.chosen_notes,
-                    e.candidates_summary,
+                    r.timestamp_utc,
+                    r.date,
+                    r.shift_id,
+                    r.shift_name,
+                    r.role,
+                    r.decision,
+                    r.staff_id,
+                    r.staff_name,
+                    r.contract_type,
+                    f"{r.score:.1f}",
+                    r.notes,
                 ])
         return "rota_explainability.csv"
 
@@ -936,7 +886,11 @@ class RotaGenerator:
             "staff_id",
             "staff_name",
             "contract_type",
-            "override_rules"
+            "is_override",
+            "is_manual_cover",
+            "override_double_shift",
+            "override_consecutive",
+            "override_reason_text",
         ])
         for e in self.override_events:
             ws4.append([
@@ -948,7 +902,11 @@ class RotaGenerator:
                 e.staff_id,
                 e.staff_name,
                 e.contract_type,
-                e.override_rules,
+                e.is_override,
+                e.is_manual_cover,
+                e.override_double_shift,
+                e.override_consecutive,
+                e.override_reason_text,
             ])
 
         ws5 = wb.create_sheet("Explainability")
@@ -958,26 +916,26 @@ class RotaGenerator:
             "shift_id",
             "shift_name",
             "role",
-            "outcome",
-            "chosen_staff_id",
-            "chosen_staff_name",
-            "chosen_score",
-            "chosen_notes",
-            "candidates_summary"
+            "decision",
+            "staff_id",
+            "staff_name",
+            "contract_type",
+            "score",
+            "notes",
         ])
-        for e in self.explainability_events:
+        for r in self.explainability:
             ws5.append([
-                e.timestamp_utc,
-                e.date,
-                e.shift_id,
-                e.shift_name,
-                e.role,
-                e.outcome,
-                e.chosen_staff_id,
-                e.chosen_staff_name,
-                e.chosen_score,
-                e.chosen_notes,
-                e.candidates_summary,
+                r.timestamp_utc,
+                r.date,
+                r.shift_id,
+                r.shift_name,
+                r.role,
+                r.decision,
+                r.staff_id,
+                r.staff_name,
+                r.contract_type,
+                float(f"{r.score:.1f}") if r.score else 0.0,
+                r.notes,
             ])
 
         out_path = os.path.join(folder, "rota.xlsx")
@@ -994,10 +952,12 @@ def demo() -> None:
     print("Running demo rota...")
     print("Config loaded from config.json")
 
+    # shifts
     long_day = ShiftTemplate("long", "Long Day", "08:00", "20:00", False)
     night = ShiftTemplate("night", "Night", "20:00", "08:00", True)
     shifts = {"long": long_day, "night": night}
 
+    # staff
     staff = [
         Staff("s1", "Amaka", "HCA", "permanent", 44, True),
         Staff("s2", "James", "HCA", "permanent", 44, True),
@@ -1011,6 +971,7 @@ def demo() -> None:
         Staff("s10", "Zara", "Senior", "bank", 0, False),
     ]
 
+    # requirements
     requirements: List[Requirement] = []
     start = datetime.strptime("2025-01-06", DATE_FMT)
     for i in range(7):
