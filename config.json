@@ -12,9 +12,6 @@
   "require_warning_ack": true,
   "warning_ack_phrase": "I UNDERSTAND",
 
-  "allow_double_shift": false,
-  "allow_exceed_consecutive_nights": false,
-  "allow_exceed_consecutive_long_days": false
 },
   "scoring_weights": {
     "hours": 1.0,
@@ -28,5 +25,11 @@
   },
   "cover_suggestions": {
     "top_n": 3
+  },
+  "explainability": {
+  "top_n_per_decision": 5
+},
+  "debug": {
+    "print_no_candidate_ranking": false
   }
 }
