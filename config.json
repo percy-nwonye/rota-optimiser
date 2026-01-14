@@ -8,11 +8,16 @@
   "allow_overrides": true,
   "interactive_overrides": true,
   "warnings_enabled": true,
-
   "require_warning_ack": true,
   "warning_ack_phrase": "I UNDERSTAND",
 
-},
+  "allow_double_shift": true,
+  "allow_exceed_consecutive_nights": true,
+  "allow_exceed_consecutive_long_days": false,
+
+  "bank_only_consecutive_override": true,
+  "bank_only_double_shift_override": true
+  },
   "scoring_weights": {
     "hours": 1.0,
     "nights": 15.0,
@@ -21,14 +26,16 @@
   "exports": {
     "export_folder": ".",
     "export_csv": true,
-    "export_excel": true
+    "export_excel": true,
+    "export_overrides_csv": true,
+    "export_explainability_csv": true
   },
   "cover_suggestions": {
     "top_n": 3
   },
   "explainability": {
-  "top_n_per_decision": 5
-},
+    "top_n_per_decision": 5
+  },
   "debug": {
     "print_no_candidate_ranking": false
   }
