@@ -1,0 +1,12 @@
+id,name,role,contract_type,target_hours_per_week,can_do_nights
+s1,Amaka,HCA,permanent,44,true
+s2,James,HCA,permanent,44,true
+s3,Fatima,HCA,permanent,33,false
+s4,Daniel,HCA,permanent,44,true
+s5,Grace,HCA,bank,0,false
+s6,Uche,HCA,bank,0,true
+s7,Ife,Senior,permanent,33,true
+s8,Tunde,Senior,permanent,44,true
+s9,Helen,Senior,bank,0,true
+s10,Zara,Senior,bank,0,false
+s11,TempNightHCA,HCA,bank,0,true

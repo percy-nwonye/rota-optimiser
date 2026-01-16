@@ -36,3 +36,5 @@ env/
 # Logs / temp
 # =========================
 *.log
+!staff.csv
+!requirements.csv

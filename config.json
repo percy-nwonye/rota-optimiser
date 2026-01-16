@@ -11,17 +11,17 @@
   "require_warning_ack": true,
   "warning_ack_phrase": "I UNDERSTAND",
 
-  "allow_double_shift": true,
-  "allow_exceed_consecutive_nights": true,
+  "allow_double_shift": false,
+  "allow_exceed_consecutive_nights": false,
   "allow_exceed_consecutive_long_days": false,
 
   "bank_only_consecutive_override": true,
   "bank_only_double_shift_override": true
   },
   "scoring_weights": {
-    "hours": 1.0,
-    "nights": 15.0,
-    "weekends": 10.0
+    "hours": 2.0,
+    "nights": 30.0,
+    "weekends": 15.0
   },
   "exports": {
     "export_folder": ".",
